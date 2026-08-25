@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────
+#  AI Early-Warning System — Configuration
+# ─────────────────────────────────────────────
+gemini:
+  gemini:
+  api_key: ""
+  model: "gemini-3.7-flash"
+  use_llm_narratives: true  
+  
+
+data:
+  synthetic_students: 5000
+  simulation_days: 90
+  snapshot_day: 75            # Features computed at this day; label = 14 days ahead
+  subjects:
+    - Physics
+    - Chemistry
+    - Mathematics
+    - Biology
+
+features:
+  rolling_windows: [7, 14, 30]
+  min_sessions_required: 3    # Students with fewer sessions are excluded
+
+model:
+  test_size: 0.2
+  random_state: 42
+  n_estimators: 400
+  learning_rate: 0.05
+  max_depth: 6
+  num_leaves: 63
+  min_child_samples: 20
+  scale_pos_weight: 3          # Handles class imbalance (3:1 ratio)
+  artifacts_dir: "models/"
+
+risk_tiers:
+  low:      [0.0, 0.40]
+  medium:   [0.40, 0.65]
+  high:     [0.65, 0.80]
+  critical: [0.80, 1.01]
+
+interventions:
+  rules:
+    score_drop_threshold: 0.20         # 20% drop triggers mentoring
+    attendance_drop_threshold: 0.30    # 30% attendance drop
+    days_inactive_threshold: 5         # Days without session
+    progress_lag_threshold: 0.30       # 30% behind batch average
+    assignment_completion_low: 0.40    # Below 40%
+    doubt_inactive_days: 14            # No doubts in 14 days
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+outcome_tracking:
+  followup_days: [7, 14]
+  recovery_threshold: 0.15    # Risk score drop ≥ 0.15 = "recovered"
+  outcomes_file: "data/outcomes.csv"
