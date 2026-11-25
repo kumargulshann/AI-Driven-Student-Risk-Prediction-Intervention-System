@@ -16,6 +16,7 @@ import shap
 import numpy as np
 import pandas as pd
 import logging
+import warnings
 from pathlib import Path
 import yaml
 
@@ -98,7 +99,9 @@ class StudentShapExplainer:
 
     def explain_batch(self, X_scaled: np.ndarray) -> np.ndarray:
         """Return SHAP values matrix (n_students × n_features)."""
-        shap_vals = self.explainer.shap_values(X_scaled)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="LightGBM binary classifier with TreeExplainer", category=UserWarning)
+            shap_vals = self.explainer.shap_values(X_scaled)
         # For binary classification LightGBM, shap_values returns list [neg, pos]
         if isinstance(shap_vals, list):
             return shap_vals[1]  # positive class

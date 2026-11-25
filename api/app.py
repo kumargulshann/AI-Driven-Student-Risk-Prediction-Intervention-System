@@ -27,25 +27,33 @@ sys.path.insert(0, str(ROOT))
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 import pandas as pd
 import numpy as np
 import logging
 import json
 import yaml
 from datetime import datetime
+from threading import Lock
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 app = FastAPI(
-    title="PW Student Early-Warning API",
-    description="AI-powered student disengagement prediction and intervention recommendation",
+    title="Student Early-Warning API",
+    description="Find students at risk of disengagement, review their risk signals, and record mentor follow-ups.",
     version="1.0.0",
+    swagger_ui_parameters={"defaultModelsExpandDepth": -1},
+    openapi_tags=[
+        {"name": "Student risk", "description": "Ranked reports, filters, and student-level explanations."},
+        {"name": "Mentor workflow", "description": "Log actions and record follow-up observations."},
+        {"name": "Evaluation", "description": "Model performance and outcome summaries."},
+        {"name": "System", "description": "Local health checks and pipeline control."},
+    ],
 )
 app.add_middleware(
     CORSMiddleware,
@@ -55,19 +63,26 @@ app.add_middleware(
 REPORT_PATH = ROOT / "data" / "processed" / "risk_report.csv"
 
 # ── Cached State ──────────────────────────────────────────────────────────────
-_cache: dict = {"report_df": None, "model_metrics": None, "loaded_at": None}
+_cache: dict = {"report_df": None, "report_version": None, "loaded_at": None}
+_pipeline_lock = Lock()
+_pipeline_state = "idle"
 
 
 def _load_report() -> pd.DataFrame:
     """Load (or return cached) risk report."""
-    if _cache["report_df"] is None or not REPORT_PATH.exists():
-        if not REPORT_PATH.exists():
-            raise HTTPException(
-                status_code=503,
-                detail="Risk report not found. Run POST /pipeline/run first.",
-            )
-        _cache["report_df"]  = pd.read_csv(REPORT_PATH)
-        _cache["loaded_at"]  = datetime.now().isoformat()
+    try:
+        version = (REPORT_PATH, REPORT_PATH.stat().st_mtime_ns)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="Risk report not found. Run POST /pipeline/run first.",
+        ) from None
+    if _cache["report_df"] is None or _cache["report_version"] != version:
+        _cache.update(
+            report_df=pd.read_csv(REPORT_PATH),
+            report_version=version,
+            loaded_at=datetime.now().isoformat(),
+        )
     return _cache["report_df"]
 
 
@@ -89,9 +104,16 @@ class StudentRiskReport(StudentRiskSummary):
     intervention_type: Optional[str]
 
 class InterventionLog(BaseModel):
-    intervention_type: str = Field(..., json_schema_extra={"example": "mentor_call"})
-    counselor_id:      str = Field(..., json_schema_extra={"example": "counselor_01"})
-    notes:             Optional[str] = None
+    intervention_type: str = Field(min_length=1, max_length=200, examples=["mentor_call"])
+    counselor_id: str = Field(min_length=1, max_length=100, examples=["mentor_01"])
+    notes: str | None = Field(default=None, max_length=1000)
+    score_before: float | None = Field(default=None, ge=0, le=100)
+
+
+class InterventionFollowup(BaseModel):
+    day: Literal[7, 14]
+    risk_score: float = Field(ge=0, le=1)
+    test_score: float | None = Field(default=None, ge=0, le=100)
 
 class PipelineRunRequest(BaseModel):
     retrain: bool = Field(default=True, description="Retrain model from scratch")
@@ -99,16 +121,21 @@ class PipelineRunRequest(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _optional_text(row: pd.Series, column: str) -> str | None:
+    value = row.get(column)
+    return str(value) if pd.notna(value) and value != "" else None
+
+
 def _row_to_summary(row: pd.Series) -> StudentRiskSummary:
     return StudentRiskSummary(
         student_id=int(row["student_id"]),
         risk_score=round(float(row["risk_score"]), 4),
         risk_tier=str(row.get("risk_tier", "")),
-        batch_id=str(row.get("batch_id", "")) or None,
-        city=str(row.get("city", "")) or None,
-        course=str(row.get("course", "")) or None,
+        batch_id=_optional_text(row, "batch_id"),
+        city=_optional_text(row, "city"),
+        course=_optional_text(row, "course"),
         urgency_hours=int(row["urgency_hours"]) if pd.notna(row.get("urgency_hours")) else None,
-        top_reasons=str(row.get("top_reasons", "")) or None,
+        top_reasons=_optional_text(row, "top_reasons"),
     )
 
 
@@ -116,15 +143,15 @@ def _row_to_report(row: pd.Series) -> StudentRiskReport:
     s = _row_to_summary(row)
     return StudentRiskReport(
         **s.model_dump(),
-        interventions=str(row.get("interventions", "")) or None,
-        llm_narrative=str(row.get("llm_narrative", "")) or None,
-        intervention_type=str(row.get("intervention_type", "")) or None,
+        interventions=_optional_text(row, "interventions"),
+        llm_narrative=_optional_text(row, "llm_narrative"),
+        intervention_type=_optional_text(row, "intervention_type"),
     )
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.get("/")
+@app.get("/", tags=["System"])
 def root():
     return {
         "message": "PW Student Early-Warning API is running 🚀",
@@ -144,17 +171,18 @@ def root():
     }
 
 
-@app.get("/health")
+@app.get("/health", tags=["System"])
 def health():
     return {
         "status": "ok",
         "report_loaded": _cache["report_df"] is not None,
         "report_loaded_at": _cache["loaded_at"],
+        "pipeline_status": _pipeline_state,
         "timestamp": datetime.now().isoformat(),
     }
 
 
-@app.get("/students/at-risk", response_model=dict)
+@app.get("/students/at-risk", response_model=dict, tags=["Student risk"])
 def get_at_risk_students(
     tier: Optional[str] = Query(None, description="Filter by tier: Low/Medium/High/Critical"),
     course: Optional[str] = Query(None, description="Filter by course"),
@@ -187,7 +215,7 @@ def get_at_risk_students(
     }
 
 
-@app.get("/students/{student_id}/risk-report", response_model=StudentRiskReport)
+@app.get("/students/{student_id}/risk-report", response_model=StudentRiskReport, tags=["Student risk"])
 def get_student_risk_report(student_id: int):
     df = _load_report()
     row = df[df["student_id"] == student_id]
@@ -196,8 +224,10 @@ def get_student_risk_report(student_id: int):
     return _row_to_report(row.iloc[0])
 
 
-@app.post("/students/{student_id}/intervention")
+@app.post("/students/{student_id}/intervention", tags=["Mentor workflow"])
 def log_intervention(student_id: int, body: InterventionLog):
+    if not body.intervention_type.strip() or not body.counselor_id.strip():
+        raise HTTPException(status_code=422, detail="Intervention type and mentor ID cannot be blank.")
     df = _load_report()
     row = df[df["student_id"] == student_id]
     if len(row) == 0:
@@ -208,10 +238,12 @@ def log_intervention(student_id: int, body: InterventionLog):
     tier  = str(row.iloc[0]["risk_tier"])
     _log(
         student_id=student_id,
-        intervention_type=body.intervention_type,
+        intervention_type=body.intervention_type.strip(),
         risk_score_before=score,
         risk_tier_before=tier,
-        counselor_id=body.counselor_id,
+        counselor_id=body.counselor_id.strip(),
+        score_before=body.score_before,
+        notes=body.notes,
     )
     return {
         "status": "logged",
@@ -222,19 +254,26 @@ def log_intervention(student_id: int, body: InterventionLog):
     }
 
 
-@app.post("/pipeline/run")
+@app.post("/pipeline/run", tags=["System"])
 def run_pipeline(body: PipelineRunRequest, background_tasks: BackgroundTasks):
     """Trigger a full pipeline run in the background."""
+    global _pipeline_state
+    if not _pipeline_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A pipeline run is already in progress.")
+    _pipeline_state = "running"
+
     def _run():
+        global _pipeline_state
         try:
             from src.pipeline import run_pipeline as _pipeline
-            result = _pipeline(train_model=body.retrain)
-            _cache["report_df"]    = result["risk_report"]
-            _cache["model_metrics"] = result["model_metrics"]
-            _cache["loaded_at"]    = datetime.now().isoformat()
-            logger.info("Pipeline run complete")
-        except Exception as e:
-            logger.error("Pipeline run failed: %s", e)
+            _pipeline(train_model=body.retrain)
+            _load_report()
+            _pipeline_state = "completed"
+        except Exception:
+            _pipeline_state = "failed"
+            logger.exception("Pipeline run failed")
+        finally:
+            _pipeline_lock.release()
 
     background_tasks.add_task(_run)
     return {
@@ -244,22 +283,32 @@ def run_pipeline(body: PipelineRunRequest, background_tasks: BackgroundTasks):
     }
 
 
-@app.get("/metrics/model")
+@app.get("/metrics/model", tags=["Evaluation"])
 def get_model_metrics():
-    from src.models.model_registry import load_model, model_exists
-    if not model_exists():
-        raise HTTPException(status_code=503, detail="No trained model. Run /pipeline/run first.")
-    _, _, _, meta = load_model()
-    return meta
+    from src.models.model_registry import load_metadata
+
+    try:
+        return load_metadata()
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="No trained model. Run /pipeline/run first.") from None
 
 
-@app.get("/metrics/outcomes")
-def get_outcome_metrics():
+@app.get("/metrics/outcomes", tags=["Evaluation"])
+def get_outcome_metrics(source: Literal["demo", "mentor"] | None = None):
     from src.tracking.outcome_tracker import compute_outcome_metrics
-    return compute_outcome_metrics()
+    return compute_outcome_metrics(source=source)
 
 
-@app.get("/stats/overview")
+@app.post("/students/{student_id}/intervention/followup", tags=["Mentor workflow"])
+def log_followup(student_id: int, body: InterventionFollowup):
+    from src.tracking.outcome_tracker import update_followup
+
+    if not update_followup(student_id, body.day, body.risk_score, body.test_score):
+        raise HTTPException(status_code=404, detail="No mentor intervention found for this student.")
+    return {"status": "logged", "student_id": student_id, "day": body.day}
+
+
+@app.get("/stats/overview", tags=["Student risk"])
 def overview_stats():
     df = _load_report()
     tier_counts = df["risk_tier"].value_counts().to_dict()

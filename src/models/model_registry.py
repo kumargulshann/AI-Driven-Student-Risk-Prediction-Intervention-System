@@ -15,7 +15,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent.parent
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 ARTIFACTS_DIR = ROOT / CFG["model"]["artifacts_dir"]
@@ -34,7 +34,7 @@ def save_model(model, scaler, feature_cols: list[str], metrics: dict) -> Path:
         "metrics":    metrics,
         "n_features": len(feature_cols),
     }
-    with open(ARTIFACTS_DIR / "metadata.json", "w") as f:
+    with (ARTIFACTS_DIR / "metadata.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     logger.info("Artifacts saved to %s", ARTIFACTS_DIR)
@@ -53,12 +53,19 @@ def load_model():
     scaler       = joblib.load(ARTIFACTS_DIR / "scaler.pkl")
     feature_cols = joblib.load(ARTIFACTS_DIR / "feature_cols.pkl")
 
-    with open(ARTIFACTS_DIR / "metadata.json") as f:
-        metadata = json.load(f)
-
+    metadata = load_metadata()
     logger.info("Model loaded | AUC-ROC: %.3f", metadata["metrics"].get("auc_roc", 0))
     return model, scaler, feature_cols, metadata
 
 
+def load_metadata() -> dict:
+    """Read evaluation metadata without unpickling model artifacts."""
+    with (ARTIFACTS_DIR / "metadata.json").open(encoding="utf-8") as f:
+        return json.load(f)
+
+
 def model_exists() -> bool:
-    return (ARTIFACTS_DIR / "risk_model.pkl").exists()
+    return all(
+        (ARTIFACTS_DIR / name).is_file()
+        for name in ("risk_model.pkl", "scaler.pkl", "feature_cols.pkl", "metadata.json")
+    )

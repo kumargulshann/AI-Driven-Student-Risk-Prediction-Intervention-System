@@ -2,11 +2,9 @@
 #  AI Early-Warning System — Configuration
 # ─────────────────────────────────────────────
 gemini:
-  gemini:
   api_key: ""
-  model: "gemini-3.7-flash"
-  use_llm_narratives: true  
-  
+  model: "gemini-3.5-flash-lite"
+  use_llm_narratives: true
 
 data:
   synthetic_students: 50000

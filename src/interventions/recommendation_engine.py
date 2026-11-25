@@ -23,21 +23,23 @@ Student 1042 | Risk: 78% | Tier: High
 ─────────────────────────────────────────────────────
 """
 
-import yaml
 import logging
 import os
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+import httpx
+import yaml
+from dotenv import dotenv_values
 
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent.parent
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 INT_CFG = CFG["interventions"]["rules"]
 USE_LLM = CFG["gemini"]["use_llm_narratives"]
-GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or CFG["gemini"]["api_key"]
 GEMINI_MODEL = CFG["gemini"]["model"]
 
 
@@ -53,6 +55,12 @@ class InterventionResult:
     urgency_hours:       int              # SLA for counselor action
     llm_narrative:       str = ""         # Gemini-generated rich text
     intervention_type:   str = ""         # e.g. "mentor_call+recovery_plan"
+
+
+@dataclass(frozen=True)
+class CounselorBrief:
+    text: str
+    source: str
 
 
 # ── Rule Engine ────────────────────────────────────────────────────────────────
@@ -160,7 +168,6 @@ def apply_rules(features: dict) -> tuple[list[str], list[str], int]:
 # ── Gemini LLM Narrative ───────────────────────────────────────────────────────
 
 def _build_llm_prompt(
-    student_id: int,
     risk_score: float,
     risk_tier: str,
     reasons: list[str],
@@ -168,10 +175,8 @@ def _build_llm_prompt(
 ) -> str:
     reasons_str      = "\n".join(f"  - {r}" for r in reasons)
     intervention_str = "\n".join(f"  {i+1}. {v}" for i, v in enumerate(interventions))
-    return f"""You are an AI academic counselor assistant at Physics Wallah (PW), India's leading
-edtech platform. Write a concise, empathetic, actionable counselor-facing alert.
+    return f"""Write a concise, empathetic brief for an academic mentor.
 
-Student ID: {student_id}
 Risk Score: {risk_score:.0%} probability of disengagement in 14 days
 Risk Tier: {risk_tier}
 
@@ -184,10 +189,64 @@ Recommended Interventions:
 Write a 3-paragraph counselor brief:
 1. Summary of student situation (1-2 sentences, include specific numbers)
 2. Why these interventions are recommended (connect to the signals)
-3. Expected outcome and urgency
+3. Follow-up timing where the listed interventions specify it
 
+Use only the supplied facts, signals, and actions. Do not add actions, estimates, or outcome claims.
 Be specific, data-driven, and empathetic. Use plain English. Do NOT use bullet points.
 Keep total response under 150 words."""
+
+
+def _gemini_api_key() -> str:
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if key:
+        return key.strip()
+    local_env = dotenv_values(ROOT / ".env", interpolate=False, encoding="utf-8-sig")
+    return (local_env.get("GEMINI_API_KEY") or local_env.get("GOOGLE_API_KEY")
+            or CFG["gemini"]["api_key"] or "").strip()
+
+
+def gemini_available() -> bool:
+    return USE_LLM and bool(_gemini_api_key())
+
+
+def generate_counselor_brief(
+    student_id: int,
+    risk_score: float,
+    risk_tier: str,
+    reasons: list[str],
+    interventions: list[str],
+) -> CounselorBrief:
+    """Draft one brief without sending the student ID or contact details."""
+    key = _gemini_api_key() if USE_LLM else ""
+    if key and interventions:
+        try:
+            response = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                headers={"x-goog-api-key": key},
+                json={
+                    "contents": [{"parts": [{"text": _build_llm_prompt(
+                        risk_score, risk_tier, reasons, interventions,
+                    )}]}],
+                    "generationConfig": {"maxOutputTokens": 512},
+                },
+                timeout=12.0,
+            )
+            response.raise_for_status()
+            candidate = response.json()["candidates"][0]
+            if candidate.get("finishReason") == "STOP":
+                text = "\n".join(part["text"] for part in candidate["content"]["parts"]
+                                 if "text" in part and not part.get("thought")).strip()
+                if text:
+                    return CounselorBrief(text, "gemini")
+            logger.warning("Gemini returned no complete brief. Using rule-based narrative.")
+        except httpx.HTTPStatusError as error:
+            logger.warning("Gemini returned HTTP %d. Using rule-based narrative.", error.response.status_code)
+        except (httpx.RequestError, ValueError, TypeError, KeyError, IndexError) as error:
+            logger.warning("Gemini brief failed (%s). Using rule-based narrative.", type(error).__name__)
+
+    return CounselorBrief(
+        _rule_based_narrative(student_id, risk_score, risk_tier, reasons, interventions), "rules",
+    )
 
 
 def generate_llm_narrative(
@@ -197,20 +256,7 @@ def generate_llm_narrative(
     reasons: list[str],
     interventions: list[str],
 ) -> str:
-    """Call Gemini API; returns rule-based fallback if call fails."""
-    if not USE_LLM or not GEMINI_KEY:
-        return _rule_based_narrative(student_id, risk_score, risk_tier, reasons, interventions)
-
-    try:
-        import google.generativeai as genai  # lazy import
-        genai.configure(api_key=GEMINI_KEY)
-        model  = genai.GenerativeModel(GEMINI_MODEL)
-        prompt = _build_llm_prompt(student_id, risk_score, risk_tier, reasons, interventions)
-        resp   = model.generate_content(prompt)
-        return resp.text.strip()
-    except Exception as exc:
-        logger.warning("Gemini API call failed (%s). Using rule-based narrative.", exc)
-        return _rule_based_narrative(student_id, risk_score, risk_tier, reasons, interventions)
+    return generate_counselor_brief(student_id, risk_score, risk_tier, reasons, interventions).text
 
 
 def _rule_based_narrative(
@@ -225,8 +271,7 @@ def _rule_based_narrative(
     return (
         f"Student {student_id} has a {risk_score:.0%} probability of disengagement in the next 14 days "
         f"({risk_tier} tier). Key signals: {reasons_str}. "
-        f"Recommended actions: {intervention_str}. "
-        f"Immediate counselor follow-up is advised to prevent dropout."
+        f"Recommended actions: {intervention_str}."
     )
 
 

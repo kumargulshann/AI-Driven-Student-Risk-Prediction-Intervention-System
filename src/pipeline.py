@@ -76,6 +76,20 @@ def _ensure_data_exists() -> bool:
 
 
 def run_pipeline(train_model: bool = True) -> dict:
+    """Run one local pipeline job at a time across the CLI, API and dashboard."""
+    from filelock import FileLock, Timeout
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with FileLock(PROCESSED_DIR / ".pipeline.lock", timeout=0):
+            return _run_pipeline(train_model)
+    except Timeout as error:
+        if str(error.lock_file).endswith(".pipeline.lock"):
+            raise RuntimeError("A pipeline run is already in progress.") from None
+        raise
+
+
+def _run_pipeline(train_model: bool) -> dict:
     """
     Execute the full pipeline.
 
@@ -194,7 +208,7 @@ def run_pipeline(train_model: bool = True) -> dict:
             risk_tier=str(row.risk_tier),
             features=feat_row.fillna(0).to_dict(),
             shap_factors=alert_factors[sid],
-            use_llm=True,
+            use_llm=False,
         )
         intervention_records.append({
             "student_id":        sid,
@@ -214,7 +228,7 @@ def run_pipeline(train_model: bool = True) -> dict:
     logger.info("Step 7/8 — Preparing outcome data …")
     if is_synthetic:
         simulate_outcomes(risk_df)
-    outcome_metrics = compute_outcome_metrics()
+    outcome_metrics = compute_outcome_metrics(source="demo" if is_synthetic else "mentor")
 
     # ── Step 8: Save Risk Report ──────────────────────────────────────────────
     logger.info("Step 8/8 — Saving risk report …")

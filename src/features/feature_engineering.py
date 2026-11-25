@@ -27,7 +27,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent.parent
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 SUBJECTS = CFG["data"]["subjects"]

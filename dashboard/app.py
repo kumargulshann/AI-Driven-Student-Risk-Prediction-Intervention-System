@@ -23,11 +23,10 @@ import sys
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 REPORT_PATH  = ROOT / "data" / "processed" / "risk_report.csv"
-OUTCOMES_PATH = ROOT / CFG["outcome_tracking"]["outcomes_file"]
 
 # ── Streamlit page config ─────────────────────────────────────────────────────
 st.set_page_config(
@@ -57,20 +56,18 @@ def load_report() -> pd.DataFrame | None:
     return df
 
 @st.cache_data(ttl=60)
-def load_outcomes() -> pd.DataFrame | None:
-    if not OUTCOMES_PATH.exists():
-        return None
-    return pd.read_csv(OUTCOMES_PATH)
+def load_outcomes() -> pd.DataFrame:
+    from src.tracking.outcome_tracker import get_outcomes_df
+
+    return get_outcomes_df()
 
 @st.cache_data(ttl=300)
 def load_model_metrics() -> dict:
+    from src.models.model_registry import load_metadata
+
     try:
-        from src.models.model_registry import load_model, model_exists
-        if not model_exists():
-            return {}
-        _, _, _, meta = load_model()
-        return meta.get("metrics", {})
-    except Exception:
+        return load_metadata().get("metrics", {})
+    except FileNotFoundError:
         return {}
 
 
@@ -80,9 +77,7 @@ def load_model_metrics() -> dict:
 
 def sidebar():
     with st.sidebar:
-        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/c/c7/Physics_Wallah_Logo.svg/320px-Physics_Wallah_Logo.svg.png",
-                 width=180)
-        st.markdown("## 🎓 Early-Warning System")
+        st.markdown("## Student Early-Warning")
         st.markdown("---")
 
         page = st.radio(
@@ -141,10 +136,11 @@ def page_overview(df: pd.DataFrame, outcomes_df: pd.DataFrame | None):
     high      = int((df["risk_tier"] == "High").sum())
     avg_risk  = df["risk_score"].mean()
 
-    rec_rate = 0.0
+    recovery = "—"
     if outcomes_df is not None and len(outcomes_df):
-        rec = outcomes_df["recovered_14d"].dropna()
-        rec_rate = float(rec.mean()) if len(rec) else 0.0
+        rec = outcomes_df.loc[outcomes_df["source"].eq("demo"), "recovered_14d"].dropna()
+        if len(rec):
+            recovery = f"{rec.mean():.1%}"
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Students",     f"{total:,}")
@@ -153,7 +149,7 @@ def page_overview(df: pd.DataFrame, outcomes_df: pd.DataFrame | None):
     col3.metric("🟠 High Risk",        f"{high:,}",
                 delta=f"{high/total*100:.1f}% of cohort",     delta_color="inverse")
     col4.metric("⚠️  Avg Risk Score",  f"{avg_risk:.2%}")
-    col5.metric("✅ Recovery Rate @14d", f"{rec_rate:.1%}")
+    col5.metric("Demo recovery @14d", recovery)
 
     st.markdown("---")
 
@@ -217,7 +213,9 @@ def page_at_risk(df: pd.DataFrame, tier_filter, course_filter, min_risk):
     if course_filter and "course" in filtered.columns:
         filtered = filtered[filtered["course"].isin(course_filter)]
 
-    st.caption(f"Showing {len(filtered):,} students after filters")
+    if filtered.empty:
+        st.info("No students match these filters.")
+        return
 
     display_cols = ["student_id", "risk_score", "risk_tier", "batch_id",
                     "city", "course", "urgency_hours", "top_reasons"]
@@ -228,17 +226,32 @@ def page_at_risk(df: pd.DataFrame, tier_filter, course_filter, min_risk):
         c = TIER_COLORS.get(val, "gray")
         return f"background-color: {c}20; color: {c}; font-weight: bold"
 
-    styled = (
-        filtered[display_cols]
-        .sort_values("risk_score", ascending=False)
-        .reset_index(drop=True)
-        .style.applymap(color_tier, subset=["risk_tier"])
-        .format({"risk_score": "{:.1%}"})
-    )
-    st.dataframe(styled, use_container_width=True, height=550)
+    ranked = filtered[display_cols].sort_values("risk_score", ascending=False, kind="stable")
+    page_size = 250
+    pages = (len(ranked) + page_size - 1) // page_size
+    page = st.number_input("Page", min_value=1, max_value=pages, step=1, disabled=pages == 1)
+    start = (page - 1) * page_size
+    end = min(start + page_size, len(ranked))
+    st.caption(f"Students {start + 1:,}–{end:,} of {len(ranked):,} matching filters")
 
-    # Download
-    csv = filtered[display_cols].to_csv(index=False)
+    styled = (ranked.iloc[start:end].style
+              .map(color_tier, subset=["risk_tier"])
+              .format({"risk_score": "{:.1%}"}))
+    st.dataframe(
+        styled, use_container_width=True, height=550, hide_index=True,
+        column_config={
+            "student_id": "Student",
+            "risk_score": "Risk",
+            "risk_tier": "Tier",
+            "batch_id": "Batch",
+            "city": "City",
+            "course": "Course",
+            "urgency_hours": st.column_config.NumberColumn("Follow-up (hours)", format="%d"),
+            "top_reasons": "Top risk signals",
+        },
+    )
+
+    csv = ranked.to_csv(index=False)
     st.download_button(
         "⬇️ Download CSV",
         csv,
@@ -255,7 +268,7 @@ def page_student_deepdive(df: pd.DataFrame):
     st.title("🔍 Student Deep-Dive")
 
     student_ids = sorted(df["student_id"].tolist())
-    selected_id = st.selectbox("Select Student ID", student_ids)
+    selected_id = st.selectbox("Select Student ID", student_ids, index=student_ids.index(df.iloc[0]["student_id"]))
 
     row = df[df["student_id"] == selected_id].iloc[0]
 
@@ -282,23 +295,20 @@ def page_student_deepdive(df: pd.DataFrame):
     st.markdown(" · ".join(f"**{k}**: {v}" for k, v in meta_row.items()))
 
     # Top reasons
-    if pd.notna(row.get("top_reasons")) and str(row.get("top_reasons")).strip():
+    reasons = _split_report_list(row.get("top_reasons"))
+    if reasons:
         st.markdown("#### ⚠️ Primary Risk Signals")
-        for reason in str(row["top_reasons"]).split(" | "):
-            if reason.strip():
-                st.markdown(f"- {reason.strip()}")
+        for reason in reasons:
+            st.markdown(f"- {reason}")
 
     # Interventions
-    if pd.notna(row.get("interventions")) and str(row.get("interventions")).strip():
+    actions = _split_report_list(row.get("interventions"))
+    if actions:
         st.markdown("#### 📋 Recommended Interventions")
-        for i, action in enumerate(str(row["interventions"]).split(" | "), 1):
-            if action.strip():
-                st.markdown(f"{i}. {action.strip()}")
-
-    # LLM narrative
-    if pd.notna(row.get("llm_narrative")) and str(row.get("llm_narrative")).strip():
-        with st.expander("🤖 AI Counselor Brief"):
-            st.markdown(str(row["llm_narrative"]))
+        for i, action in enumerate(actions, 1):
+            st.markdown(f"{i}. {action}")
+        _show_counselor_brief(int(selected_id), score, tier, reasons, actions, row.get("llm_narrative"))
+        _show_intervention_form(int(selected_id), score, tier, actions)
 
     # Risk score gauge
     st.markdown("#### 🎯 Risk Score Gauge")
@@ -327,6 +337,62 @@ def page_student_deepdive(df: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _split_report_list(value) -> list[str]:
+    return [item.strip() for item in value.split(" | ") if item.strip()] if isinstance(value, str) else []
+
+
+def _show_counselor_brief(student_id, score, tier, reasons, actions, rule_text):
+    from src.interventions.recommendation_engine import gemini_available, generate_counselor_brief
+
+    with st.expander("Counselor brief", expanded=True):
+        if isinstance(rule_text, str) and rule_text.strip():
+            st.write(rule_text)
+        if not gemini_available():
+            st.caption("Add GEMINI_API_KEY to the project's .env file to enable optional Gemini drafting.")
+            return
+
+        case = (student_id, score, tier, tuple(reasons), tuple(actions))
+        if st.button("Draft with Gemini", key="draft_counselor_brief"):
+            with st.spinner("Drafting the counselor brief…"):
+                brief = generate_counselor_brief(student_id, score, tier, reasons, actions)
+                st.session_state["counselor_brief"] = (case, brief)
+
+        saved = st.session_state.get("counselor_brief")
+        if saved and saved[0] == case:
+            brief = saved[1]
+            if brief.source == "gemini":
+                st.caption("Gemini draft · Review before using")
+                st.write(brief.text)
+            else:
+                st.info("Gemini couldn't draft a brief. The rule-based brief is available above.")
+                if not isinstance(rule_text, str) or not rule_text.strip():
+                    st.write(brief.text)
+
+
+def _show_intervention_form(student_id, score, tier, actions):
+    from filelock import Timeout
+    from src.tracking.outcome_tracker import log_intervention
+
+    with st.expander("Log an intervention"):
+        with st.form("log_intervention", clear_on_submit=True):
+            action = st.selectbox("Action taken", actions)
+            counselor = st.text_input("Mentor ID", max_chars=100)
+            notes = st.text_area("Notes (optional)", max_chars=1000)
+            submitted = st.form_submit_button("Save intervention")
+        if not submitted:
+            return
+        if not counselor.strip():
+            st.error("Enter a mentor ID before saving.")
+            return
+        try:
+            log_intervention(student_id, action, score, tier, counselor.strip(), notes=notes.strip() or None)
+        except (OSError, Timeout):
+            st.error("The intervention could not be saved. Please try again.")
+        else:
+            load_outcomes.clear()
+            st.success("Intervention saved.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page 4 — Intervention Tracker
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,8 +400,11 @@ def page_student_deepdive(df: pd.DataFrame):
 def page_interventions(outcomes_df: pd.DataFrame | None):
     st.title("📋 Intervention Tracker & Outcomes")
 
-    if outcomes_df is None or len(outcomes_df) == 0:
-        st.info("No intervention data yet. Run the pipeline to simulate outcomes.")
+    source = st.radio("Outcome source", ["Simulated demo", "Mentor log"], horizontal=True)
+    if outcomes_df is not None:
+        outcomes_df = outcomes_df.loc[outcomes_df["source"].eq("demo" if source == "Simulated demo" else "mentor")]
+    if outcomes_df is None or outcomes_df.empty:
+        st.info("No interventions for this view yet.")
         return
 
     # KPIs
@@ -346,21 +415,20 @@ def page_interventions(outcomes_df: pd.DataFrame | None):
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Interventions",      f"{total:,}")
-    c2.metric("Recovery Rate @7d",        f"{rec_7d:.1%}")
-    c3.metric("Recovery Rate @14d",       f"{rec_14d:.1%}")
-    c4.metric("Avg Score Improvement",    f"+{score_imp:.1f} pts")
+    c2.metric("Recovery Rate @7d",        f"{rec_7d:.1%}" if pd.notna(rec_7d) else "—")
+    c3.metric("Recovery Rate @14d",       f"{rec_14d:.1%}" if pd.notna(rec_14d) else "—")
+    c4.metric("Avg Score Change",        f"{score_imp:+.1f} pts" if pd.notna(score_imp) else "—")
 
     st.markdown("---")
 
     c5, c6 = st.columns(2)
     with c5:
-        st.subheader("Students Recovered per 1,000 Flagged")
-        rec_1000 = rec_14d * 1000
+        st.subheader("Recovery per 1,000 Follow-ups")
         fig = go.Figure(go.Bar(
             x=["@7 days", "@14 days"],
             y=[rec_7d * 1000, rec_14d * 1000],
             marker_color=["#4299E1", "#38A169"],
-            text=[f"{rec_7d*1000:.0f}", f"{rec_14d*1000:.0f}"],
+            text=[f"{rate * 1000:.0f}" if pd.notna(rate) else "" for rate in (rec_7d, rec_14d)],
             textposition="outside",
         ))
         fig.update_layout(
@@ -417,7 +485,8 @@ def page_model_health():
     c1.metric("AUC-ROC",          f"{metrics.get('auc_roc', 0):.3f}")
     c2.metric("Avg Precision",    f"{metrics.get('avg_precision', 0):.3f}")
     c3.metric("F1 Score @50%",    f"{metrics.get('f1_at_50', 0):.3f}")
-    c4.metric("CV AUC (5-fold)",  f"{metrics.get('cv_auc_mean', 0):.3f} ± {metrics.get('cv_auc_std', 0):.3f}")
+    cv_auc = f"{metrics['cv_auc_mean']:.3f} ± {metrics['cv_auc_std']:.3f}" if "cv_auc_mean" in metrics else "Unavailable"
+    c4.metric("CV AUC (5-fold)", cv_auc)
 
     st.markdown("---")
     st.subheader("Metrics Summary")
@@ -425,13 +494,15 @@ def page_model_health():
     metric_rows = [
         ("Precision @50%",   metrics.get("precision_at_50", 0), "0.3f"),
         ("Recall @50%",      metrics.get("recall_at_50", 0),    "0.3f"),
+        ("Brier score before calibration", metrics.get("brier_before"), "0.3f"),
+        ("Brier score after calibration", metrics.get("brier_after"), "0.3f"),
         ("Positive Rate",    metrics.get("positive_rate", 0),   ".1%"),
         ("Test Set Size",    metrics.get("test_size", 0),        "d"),
     ]
     for name, val, fmt in metric_rows:
         col_l, col_r = st.columns([2, 1])
         col_l.markdown(f"**{name}**")
-        col_r.markdown(f"`{val:{fmt}}`")
+        col_r.markdown("Unavailable" if val is None else f"`{val:{fmt}}`")
 
     st.markdown("---")
     st.subheader("Risk Tier Thresholds")
@@ -444,8 +515,8 @@ def page_model_health():
 
     st.info(
         "💡 **Model**: LightGBM + Platt Scaling Calibration\n\n"
-        "**Imbalance handling**: `scale_pos_weight=3`\n\n"
-        "**Evaluation**: Stratified 5-fold cross-validation"
+        f"**Imbalance handling**: `scale_pos_weight={CFG['model']['scale_pos_weight']}`\n\n"
+        "**Evaluation**: Stratified cross-validation on the development set, plus a held-out test set"
     )
 
 

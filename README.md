@@ -15,6 +15,16 @@ ranked intervention list.
 > (behavioral dynamics modeled from real engagement patterns). The code is designed
 > to run unchanged on real engagement logs.
 
+## What it looks like
+
+**Mentor risk queue** with risk tiers, follow-up deadlines and the signals behind each score.
+
+![Streamlit dashboard showing the ranked student risk queue](assets/dashboard-risk-tiers.png)
+
+**Interactive API documentation** for reading risk reports, recording interventions and checking evaluation metrics.
+
+![FastAPI Swagger documentation showing student-risk and mentor-workflow endpoints](assets/api-docs.png)
+
 ## Example Output
 
 ```
@@ -195,9 +205,39 @@ so that `python`, `pip`, and the application commands share the same dependencie
 Edit `config.yaml` to tune the project.
 
 - **Synthetic dataset size and forecast cutoff**
-- **Gemini model and narrative toggle**. Set `GEMINI_API_KEY` in the environment
-  to enable Gemini. Without a key, the pipeline uses the rule-based narrative.
+- **Gemini model and narrative toggle**
 - **Risk tier thresholds** (Low/Medium/High/Critical)
 - **Intervention rules** (drop thresholds, inactivity thresholds)
 - **Model hyperparameters** (n_estimators, learning_rate, etc.)
 - **Outcome tracking** (recovery threshold, follow-up days)
+
+### Optional Gemini counselor briefs
+
+Create an API key in [Google AI Studio](https://aistudio.google.com/apikey).
+In the project root, add the following line to `.env` using your own key.
+Use `.env.example` as a template for a new file.
+
+```dotenv
+GEMINI_API_KEY=replace_with_your_key
+```
+
+The Git-ignored `.env` is read automatically. Open **Student Deep-Dive**, select
+a student with recommended actions, and choose **Draft with Gemini** in
+**Counselor brief**. The default model is `gemini-3.5-flash-lite`. The request
+contains the risk score, tier, model signals and rule-selected actions.
+Training and bulk reports use rule-based briefs and can run offline.
+
+### Mentor workflow
+
+1. Filter **At-Risk Students** by risk tier or course, then look up a flagged
+   student in **Student Deep-Dive**.
+2. Review the risk signals and recommended actions. Use **Log an intervention**
+   to record what you did.
+3. Record a follow-up through `POST /students/{student_id}/intervention/followup`
+   in the API docs. Use **Intervention Tracker** to switch between the mentor
+   log and simulated demo outcomes.
+
+The demo outcomes ship with the repository. Mentor entries are saved locally in
+`data/mentor_outcomes.csv`, which Git ignores. Pipeline reruns refresh the
+simulation without overwriting mentor entries. Use the dashboard and API as a
+local demo with synthetic data.
