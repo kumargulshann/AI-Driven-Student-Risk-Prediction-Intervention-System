@@ -14,7 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent.parent
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 REQUIRED_EVENT_COLS = [
@@ -45,7 +45,9 @@ def load_raw_data(
     if before_day is None:
         events_df = pd.read_csv(events_path, low_memory=False)
     else:
-        # Compact dtypes and early cutoff keep large raw exports within memory.
+        # Parse bounded chunks so the CSV reader never materializes all input
+        # strings or post-snapshot events in memory at once.
+        _validate_schema(pd.read_csv(events_path, nrows=0), REQUIRED_EVENT_COLS, "events")
         dtypes = {
             **dict.fromkeys(("batch_id", "city", "course", "subject"), "category"),
             **dict.fromkeys(("day", "student_id"), "int64"),
@@ -53,10 +55,13 @@ def load_raw_data(
                              "doubt_asked", "revision_done"), "uint8"),
             **dict.fromkeys(("completion_rate", "test_score", "app_minutes"), "float32"),
         }
-        events_df = pd.read_csv(
-            events_path, dtype=dtypes, usecols=lambda column: column in REQUIRED_EVENT_COLS,
-        )
-        events_df = events_df.loc[events_df["day"].lt(before_day)].reset_index(drop=True)
+        with pd.read_csv(
+            events_path, dtype=dtypes, usecols=REQUIRED_EVENT_COLS, chunksize=500_000,
+        ) as chunks:
+            events_df = pd.concat(
+                (chunk.loc[chunk["day"].lt(before_day)] for chunk in chunks),
+                ignore_index=True,
+            )
     labels_df = pd.read_csv(labels_path)
 
     _validate_schema(events_df, REQUIRED_EVENT_COLS, "events")

@@ -25,10 +25,10 @@ import time
 import yaml
 import json
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 import pandas as pd
-import numpy as np
 
-ROOT = Path(__file__).parent.parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # ── configure root logger ─────────────────────────────────────────────────────
@@ -39,12 +39,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline")
 
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 SNAPSHOT_DAY = CFG["data"]["snapshot_day"]
 SUBJECTS     = CFG["data"]["subjects"]
 PROCESSED_DIR = ROOT / "data" / "processed"
+ASSETS_DIR = ROOT / "assets"
+SHAP_BATCH_SIZE = 2_000
 
 
 def _ensure_data_exists() -> bool:
@@ -113,26 +115,33 @@ def run_pipeline(train_model: bool = True) -> dict:
     logger.info("Step 2/8 — Engineering features …")
     feat_df = build_features(daily_df, subject_dfs, SNAPSHOT_DAY - 1)
     del daily_df, subject_dfs
-    feat_df = fill_missing_features(feat_df)
-    feature_cols = get_feature_columns(feat_df)
+    # Peer comparisons serve the intervention rules. The model uses individual
+    # history only, so held-out students cannot influence fitted inputs.
+    feature_cols = [col for col in get_feature_columns(feat_df) if not col.endswith("_vs_batch")]
     logger.info("  → %d features for %d students", len(feature_cols), len(feat_df))
 
     # ── Step 3: Model ─────────────────────────────────────────────────────────
     from src.models.model_registry import save_model, load_model, model_exists
     from src.models.risk_model import train_model as _train, predict_risk, cross_validate_model
 
-    if train_model or not model_exists():
+    retrain = train_model or not model_exists()
+    if retrain:
         logger.info("Step 3/8 — Training risk model …")
-        model, scaler, metrics, X_test, y_test = _train(feat_df, labels_df, feature_cols)
-        save_model(model, scaler, feature_cols, metrics)
+        model, scaler, metrics, X_test, _ = _train(
+            feat_df, labels_df, feature_cols, calibration_plot=ASSETS_DIR / "calibration_curve.png",
+        )
 
         logger.info("Step 3b/8 — Cross-validation …")
         cv_metrics = cross_validate_model(feat_df, labels_df, feature_cols)
         metrics.update(cv_metrics)
+        save_model(model, scaler, feature_cols, metrics)
     else:
         logger.info("Step 3/8 — Loading existing model from registry …")
         model, scaler, feature_cols, meta = load_model()
         metrics = meta["metrics"]
+        # Legacy artifacts were trained with median-imputed features.
+        if "brier_after" not in metrics:
+            feat_df = fill_missing_features(feat_df)
 
     # ── Step 4: Score Students ────────────────────────────────────────────────
     logger.info("Step 4/8 — Scoring all students …")
@@ -146,28 +155,45 @@ def run_pipeline(train_model: bool = True) -> dict:
     from src.explainability.shap_explainer import StudentShapExplainer
 
     logger.info("Step 5/8 — Computing SHAP explanations …")
-    alerts = risk_df.loc[risk_df["risk_tier"].isin(["High", "Critical"])]
-    indexed_features = feat_df.set_index("student_id")
-    alert_features = indexed_features.loc[alerts["student_id"]]
     explainer = StudentShapExplainer(model, feature_cols)
-    shap_values = explainer.explain_batch(
-        scaler.transform(alert_features[feature_cols].to_numpy(dtype="float32"))
-    ) if len(alerts) else []
-    logger.info("  Computed SHAP for %d at-risk students", len(alerts))
+    if retrain:
+        from src.models.evaluation_plots import save_shap_summary
+
+        save_shap_summary(
+            explainer, X_test, ASSETS_DIR / "shap_summary.png", seed=CFG["model"]["random_state"],
+        )
+
+    # Compute bounded batches once. Keep human-readable reasons on all reports
+    # and retain full factor records only for students with interventions.
+    alerts = risk_df.loc[risk_df["risk_tier"].isin(["High", "Critical"])]
+    alert_ids = set(alerts["student_id"])
+    indexed_features = feat_df.set_index("student_id")
+    reasons_by_id = {}
+    alert_factors = {}
+    for offset in range(0, len(feat_df), SHAP_BATCH_SIZE):
+        batch = indexed_features.iloc[offset:offset + SHAP_BATCH_SIZE]
+        scaled = scaler.transform(batch[feature_cols].to_numpy(dtype="float32"))
+        for (sid, row), values in zip(batch.iterrows(), explainer.explain_batch(scaled)):
+            factors = explainer.factors_from_values(values, row)
+            reasons_by_id[sid] = " | ".join(factor["narrative"] for factor in factors)
+            if sid in alert_ids:
+                alert_factors[sid] = factors
+    risk_df["top_reasons"] = risk_df["student_id"].map(reasons_by_id)
+    logger.info("  Computed SHAP for %d students", len(reasons_by_id))
 
     from src.interventions.recommendation_engine import generate_intervention
 
-    logger.info("Step 6/8 — Generating interventions …")
+    logger.info("Step 6/8 — Generating interventions for %d students …", len(alerts))
     intervention_records = []
-    for row, (_, feat_row), sv in zip(alerts.itertuples(index=False), alert_features.iterrows(), shap_values):
+    for row in alerts.itertuples(index=False):
         sid = int(row.student_id)
-        factors = explainer.factors_from_values(sv, feat_row)
+        feat_row = indexed_features.loc[sid]
         result = generate_intervention(
             student_id=sid,
             risk_score=float(row.risk_score),
             risk_tier=str(row.risk_tier),
             features=feat_row.fillna(0).to_dict(),
-            shap_factors=factors,
+            shap_factors=alert_factors[sid],
             use_llm=True,
         )
         intervention_records.append({
@@ -175,12 +201,11 @@ def run_pipeline(train_model: bool = True) -> dict:
             "intervention_type": result.intervention_type,
             "urgency_hours":     result.urgency_hours,
             "interventions":     " | ".join(result.interventions),
-            "top_reasons":       " | ".join(result.top_reasons),
             "llm_narrative":     result.llm_narrative,
         })
 
     interventions_df = pd.DataFrame(intervention_records, columns=[
-        "student_id", "intervention_type", "urgency_hours", "interventions", "top_reasons", "llm_narrative",
+        "student_id", "intervention_type", "urgency_hours", "interventions", "llm_narrative",
     ])
 
     # ── Step 7: Simulate Outcomes ─────────────────────────────────────────────
@@ -204,17 +229,24 @@ def run_pipeline(train_model: bool = True) -> dict:
     )
 
     report_path = PROCESSED_DIR / "risk_report.csv"
-    report_df.to_csv(report_path, index=False)
+    with NamedTemporaryFile(dir=PROCESSED_DIR, suffix=".tmp", delete=False) as staging:
+        report_tmp = Path(staging.name)
+    try:
+        report_df.to_csv(report_tmp, index=False)
+        report_tmp.replace(report_path)
+    finally:
+        report_tmp.unlink(missing_ok=True)
 
     elapsed = time.time() - t0
     logger.info("✅  Pipeline complete in %.1fs | Report: %s", elapsed, report_path)
-    logger.info("📊  Model AUC-ROC: %.3f | CV-AUC: %.3f ± %.3f",
-                metrics.get("auc_roc", 0),
-                metrics.get("cv_auc_mean", 0),
-                metrics.get("cv_auc_std", 0))
-    logger.info("🎯  Recovery rate @14d: %.1f%% | Score improvement: +%.1f pts",
-                outcome_metrics.get("recovery_rate_14d", 0) * 100,
-                outcome_metrics.get("avg_score_improvement", 0))
+    if "cv_auc_mean" in metrics:
+        logger.info(
+            "Held-out AUC: %.6f | CV AUC: %.6f ± %.6f",
+            metrics["auc_roc"], metrics["cv_auc_mean"], metrics["cv_auc_std"],
+        )
+    if is_synthetic and "recovery_rate_14d" in outcome_metrics:
+        logger.info("Simulated recovery @14d: %.1f%% | Simulated score change: %+.1f pts",
+                    outcome_metrics["recovery_rate_14d"] * 100, outcome_metrics["avg_score_improvement"])
 
     return {
         "risk_report":     report_df,

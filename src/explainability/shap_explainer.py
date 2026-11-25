@@ -22,7 +22,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent.parent
-with open(ROOT / "config.yaml") as f:
+with (ROOT / "config.yaml").open(encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 SUBJECTS = CFG["data"]["subjects"]
@@ -121,14 +121,11 @@ class StudentShapExplainer:
         return self.factors_from_values(sv, feat_df_row, top_k)
 
     def factors_from_values(self, sv, feat_df_row, top_k=3):
-        # Format the strongest risk contributions from a precomputed SHAP row.
-        # Sort by |SHAP| descending, pick positive-SHAP (risk-increasing) first
-        indices = np.argsort(-np.abs(sv))[:top_k * 2]
-        # Prefer factors that INCREASE risk
-        pos_first = sorted(indices, key=lambda i: -sv[i])[:top_k]
+        """Format the features with the largest contributions toward higher risk."""
+        indices = np.argsort(-sv, kind="stable")[:top_k]
 
         factors = []
-        for i in pos_first:
+        for i in indices:
             col   = self.feature_cols[i]
             label = get_feature_label(col)
             val   = feat_df_row[col] if col in feat_df_row.index else None
@@ -137,7 +134,7 @@ class StudentShapExplainer:
                 "shap":      float(sv[i]),
                 "label":     label,
                 "value":     val,
-                "narrative": _to_narrative(col, val, float(sv[i])),
+                "narrative": _to_narrative(col, val),
             })
         return factors
 
@@ -151,45 +148,36 @@ def _extract_lgbm(calibrated_model):
         return calibrated_model
 
 
-def _to_narrative(col: str, val, shap_val: float) -> str:
-    """Convert a (feature, value, shap) triple to a human-readable sentence."""
+def _to_narrative(col: str, val) -> str:
+    """Describe the observed value in its original units."""
     label = get_feature_label(col)
 
-    if val is None or (isinstance(val, float) and np.isnan(val)):
+    if pd.isna(val):
         return f"{label} — data unavailable"
 
     val_f = float(val)
 
-    # Percentage-style features
+    if col == "score_delta_14d":
+        return f"{label}: {val_f:+.1f} points"
+    if col == "score_slope_14d":
+        return f"{label}: {val_f:+.1f} points per observation"
+    if col.endswith("_vs_batch"):
+        if col.startswith("app"):
+            return f"{label}: {val_f:+.1f} minutes"
+        difference = val_f if col.startswith("score") else val_f * 100
+        return f"{label}: {difference:+.1f} percentage points"
     if "drop_pct" in col or "delta" in col:
-        pct = val_f * 100
-        direction = "dropped" if shap_val > 0 else "improved"
-        return f"{label.replace(' drop %','').replace(' drop','')} {direction} by {pct:.0f}%"
-
-    # Score features
-    if "score" in col and "drop" not in col and "slope" not in col:
-        return f"{label}: {val_f:.1f}%"
-
-    # Rate features (0-1)
-    if "rate" in col or "attend" in col.split("_")[0]:
-        return f"{label}: {val_f*100:.0f}%"
-
-    # Session gap
+        return f"{label}: {val_f:.0%}"
     if "days_since" in col:
-        return f"No active session for {int(val_f)} days"
-
-    # Attempt/count features
+        return f"Days since last attended lecture: {int(val_f)}"
     if "count" in col or "attempts" in col or "freq" in col or "revision" in col:
         return f"{label}: {int(val_f)} times"
-
-    # App minutes
+    if "score" in col:
+        return f"{label}: {val_f:.1f}%"
+    if "rate" in col or "_attend_" in col:
+        return f"{label}: {val_f:.0%}"
     if "app_minutes" in col:
         return f"{label}: {val_f:.0f} minutes"
-
-    # Batch comparison features
-    if "vs_batch" in col:
-        sign = "above" if val_f > 0 else "below"
-        return f"{label}: {abs(val_f):.1f}% {sign} batch average"
 
     return f"{label}: {val_f:.2f}"
 
