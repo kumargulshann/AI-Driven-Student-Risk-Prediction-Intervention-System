@@ -106,3 +106,28 @@ def test_get_feature_columns_excludes_id():
     assert "student_id" not in cols
     assert "feat_a" in cols
     assert "feat_b" in cols
+
+
+def test_first_label_day_is_excluded_from_pipeline_features(tmp_path):
+    from src.features.feature_engineering import build_features
+    from src.ingestion.data_loader import load_raw_data, pivot_to_daily
+
+    events_path = tmp_path / "events.csv"
+    labels_path = tmp_path / "labels.csv"
+    pd.DataFrame({
+        "student_id": [1, 1, 1], "day": [73, 74, 75],
+        "batch_id": "BATCH_001", "city": "Delhi", "course": "JEE Mains",
+        "subject": "Physics", "attended_lecture": [1, 0, 1],
+        "completion_rate": [1.0, 0.0, 1.0], "test_attempted": [1, 0, 1],
+        "test_score": [70.0, np.nan, 100.0], "assignment_done": [1, 0, 1],
+        "doubt_asked": 0, "revision_done": 0, "app_minutes": 60.0,
+    }).to_csv(events_path, index=False)
+    pd.DataFrame({"student_id": [1], "disengaged_in_14d": [1]}).to_csv(labels_path, index=False)
+
+    events, _ = load_raw_data(events_path, labels_path, before_day=75)
+    features = build_features(pivot_to_daily(events), {}, snapshot_day=74).iloc[0]
+
+    assert events["day"].tolist() == [73, 74]
+    assert features["attend_rate_7d"] == 0.5
+    assert features["test_score_avg_7d"] == 70.0
+    assert features["days_since_last_session"] == 1

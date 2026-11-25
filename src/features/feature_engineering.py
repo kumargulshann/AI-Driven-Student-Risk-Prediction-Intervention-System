@@ -67,148 +67,81 @@ def build_features(
     snapshot_day: int,
     batch_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """
-    Build a feature row for every student in `daily_df` at `snapshot_day`.
+    """Build one row per student using daily events through snapshot_day."""
+    history = daily_df.loc[daily_df["day"].le(snapshot_day)]
+    features = pd.DataFrame(index=pd.Index(history["student_id"].unique(), name="student_id"))
+    windows = {days: _window(history, snapshot_day, days) for days in (7, 14, 30)}
+    for days, window in windows.items():
+        grouped = window.groupby("student_id", sort=False)
+        features[f"attend_rate_{days}d"] = grouped["attend_rate"].mean().reindex(features.index, fill_value=0)
+        features[f"attend_count_{days}d"] = grouped["attended_any"].sum().reindex(features.index, fill_value=0)
+        features[f"test_score_avg_{days}d"] = grouped["test_score_mean"].mean()
+        features[f"test_attempts_{days}d"] = grouped["test_attempted_any"].sum().reindex(features.index, fill_value=0)
+        if days != 30:
+            features[f"session_freq_{days}d"] = features[f"attend_count_{days}d"]
+            features[f"assignment_rate_{days}d"] = grouped["assignment_done"].mean().reindex(features.index, fill_value=0)
+            features[f"doubt_count_{days}d"] = grouped["doubt_asked"].sum().reindex(features.index, fill_value=0)
+            features[f"revision_count_{days}d"] = grouped["revision_done"].sum().reindex(features.index, fill_value=0)
+            features[f"app_minutes_{days}d"] = grouped["app_minutes"].mean()
 
-    Parameters
-    ----------
-    daily_df     : aggregated daily signals (output of data_loader.pivot_to_daily)
-    subject_dfs  : {subject_name: subject-level daily df}
-    snapshot_day : the reference day (features use history before this day)
-    batch_df     : pre-computed batch averages per day (optional, derived internally if None)
+    features["attend_delta_7_14"] = _positive_drop(features["attend_rate_14d"], features["attend_rate_7d"])
+    features["doubt_delta_7_14"] = _positive_drop(features["doubt_count_14d"], features["doubt_count_7d"])
+    features["app_delta_7_14"] = _positive_drop(features["app_minutes_14d"], features["app_minutes_7d"])
 
-    Returns
-    -------
-    pd.DataFrame with one row per student and all features.
-    """
-    student_ids = daily_df["student_id"].unique()
-    feature_rows = []
+    recent = windows[14]
+    features["completion_rate_14d"] = recent.groupby("student_id", sort=False)["completion_rate"].mean()
+    features["score_slope_14d"] = _grouped_score_slope(recent).reindex(features.index, fill_value=0)
+    previous = recent.loc[recent["day"].le(snapshot_day - 7)]
+    previous_scores = previous.groupby("student_id", sort=False)["test_score_mean"].mean()
+    features["score_delta_14d"] = (features["test_score_avg_7d"] - previous_scores).fillna(0)
 
-    # Compute batch-level aggregates once
-    batch_avg = _compute_batch_averages(daily_df, snapshot_day)
+    active = history.loc[history["attended_any"].gt(0), ["student_id", "day"]]
+    last_session = active.groupby("student_id", sort=False)["day"].max()
+    features["days_since_last_session"] = (snapshot_day - last_session).reindex(features.index, fill_value=30)
 
-    for sid in student_ids:
-        sdf = daily_df[daily_df["student_id"] == sid].sort_values("day")
-        row = _build_student_features(sid, sdf, subject_dfs, snapshot_day, batch_avg)
-        feature_rows.append(row)
+    # Historical cohort comparisons are available to the rules engine.
+    for suffix, student_col, daily_col in (
+        ("attend", "attend_rate_14d", "attend_rate"),
+        ("score", "test_score_avg_14d", "test_score_mean"),
+        ("progress", "completion_rate_14d", "completion_rate"),
+        ("app", "app_minutes_14d", "app_minutes"),
+    ):
+        features[f"{suffix}_vs_batch"] = features[student_col] - recent[daily_col].mean()
 
-    feat_df = pd.DataFrame(feature_rows)
-    logger.info("Built %d feature rows with %d features", len(feat_df), feat_df.shape[1] - 1)
-    return feat_df
+    for subject, daily in subject_dfs.items():
+        name = subject.lower()
+        columns = [f"{name}_attend", f"{name}_score"]
+        fortnight = _window(daily, snapshot_day, 14).groupby("student_id", sort=False)[columns].mean()
+        week = _window(daily, snapshot_day, 7).groupby("student_id", sort=False)[columns].mean()
+        features[f"{name}_attend_14d"] = fortnight[columns[0]]
+        features[f"{name}_attend_drop_pct"] = _positive_drop(fortnight[columns[0]], week[columns[0]])
+        features[f"{name}_score_14d"] = fortnight[columns[1]]
+        features[f"{name}_score_7d"] = week[columns[1]]
+        features[f"{name}_score_drop_pct"] = _positive_drop(fortnight[columns[1]], week[columns[1]])
 
-
-def _compute_batch_averages(daily_df: pd.DataFrame, snapshot_day: int) -> dict:
-    """Compute batch-level averages in the 14-day window before snapshot."""
-    window = _window(daily_df, snapshot_day, 14)
-    return {
-        "attend_14d":    window["attend_rate"].mean(),
-        "score_14d":     window["test_score_mean"].mean(),
-        "progress_14d":  window["completion_rate"].mean(),
-        "app_min_14d":   window["app_minutes"].mean(),
-    }
-
-
-def _build_student_features(
-    sid: int,
-    sdf: pd.DataFrame,
-    subject_dfs: dict[str, pd.DataFrame],
-    snapshot_day: int,
-    batch_avg: dict,
-) -> dict:
-    row: dict = {"student_id": sid}
-
-    # ── 1. Attendance ──────────────────────────────────────────────────────────
-    for w in [7, 14, 30]:
-        wdf = _window(sdf, snapshot_day, w)
-        row[f"attend_rate_{w}d"]   = wdf["attend_rate"].mean()   if len(wdf) else 0.0
-        row[f"attend_count_{w}d"]  = wdf["attended_any"].sum()   if len(wdf) else 0
-
-    row["attend_delta_7_14"]   = _pct_drop(
-        row["attend_rate_14d"], row["attend_rate_7d"]
-    )
-    row["completion_rate_14d"] = _window(sdf, snapshot_day, 14)["completion_rate"].mean()
-
-    # ── 2. Test Performance ────────────────────────────────────────────────────
-    for w in [7, 14, 30]:
-        wdf  = _window(sdf, snapshot_day, w)
-        scores = wdf["test_score_mean"].dropna()
-        row[f"test_score_avg_{w}d"]  = scores.mean()   if len(scores) else np.nan
-        row[f"test_attempts_{w}d"]   = wdf["test_attempted_any"].sum() if len(wdf) else 0
-
-    row["score_slope_14d"]    = _score_slope(_window(sdf, snapshot_day, 14)["test_score_mean"])
-    row["score_delta_14d"]    = _safe_score_delta(sdf, snapshot_day)
-
-    # ── 3. Session Behavior ────────────────────────────────────────────────────
-    active_days = sdf[sdf["day"] <= snapshot_day]["day"]
-    if len(active_days):
-        row["days_since_last_session"] = snapshot_day - active_days.max()
-    else:
-        row["days_since_last_session"] = 30  # penalize absent students
-    row["session_freq_7d"]  = _window(sdf, snapshot_day, 7)["attended_any"].sum()
-    row["session_freq_14d"] = _window(sdf, snapshot_day, 14)["attended_any"].sum()
-
-    # ── 4. Assignment Completion ───────────────────────────────────────────────
-    for w in [7, 14]:
-        wdf = _window(sdf, snapshot_day, w)
-        row[f"assignment_rate_{w}d"] = wdf["assignment_done"].mean() if len(wdf) else 0.0
-
-    # ── 5. Doubt Activity ─────────────────────────────────────────────────────
-    row["doubt_count_7d"]    = _window(sdf, snapshot_day, 7)["doubt_asked"].sum()
-    row["doubt_count_14d"]   = _window(sdf, snapshot_day, 14)["doubt_asked"].sum()
-    row["doubt_delta_7_14"]  = _pct_drop(
-        max(row["doubt_count_14d"], 1e-6),
-        max(row["doubt_count_7d"],  1e-6)
-    )
-
-    # ── 6. Revision Behavior ───────────────────────────────────────────────────
-    row["revision_count_14d"] = _window(sdf, snapshot_day, 14)["revision_done"].sum()
-    row["revision_count_7d"]  = _window(sdf, snapshot_day, 7)["revision_done"].sum()
-
-    # ── 7. App Engagement ─────────────────────────────────────────────────────
-    row["app_minutes_7d"]  = _window(sdf, snapshot_day, 7)["app_minutes"].mean()
-    row["app_minutes_14d"] = _window(sdf, snapshot_day, 14)["app_minutes"].mean()
-    row["app_delta_7_14"]  = _pct_drop(row["app_minutes_14d"] or 1e-6,
-                                        row["app_minutes_7d"] or 1e-6)
-
-    # ── 8. Peer / Batch Comparison ────────────────────────────────────────────
-    row["attend_vs_batch"]   = row["attend_rate_14d"] - batch_avg["attend_14d"]
-    row["score_vs_batch"]    = (row["test_score_avg_14d"] or 0) - batch_avg["score_14d"]
-    row["progress_vs_batch"] = row["completion_rate_14d"] - batch_avg["progress_14d"]
-    row["app_vs_batch"]      = row["app_minutes_14d"] - batch_avg["app_min_14d"]
-
-    # ── 9. Subject-Level Signals ──────────────────────────────────────────────
-    for subj, sdf_subj in subject_dfs.items():
-        subj_lc = subj.lower()
-        ssdf = sdf_subj[sdf_subj["student_id"] == sid].sort_values("day")
-
-        attend_col = f"{subj_lc}_attend"
-        score_col  = f"{subj_lc}_score"
-
-        att_14 = _window(ssdf, snapshot_day, 14)[attend_col].mean() if len(ssdf) else 0.0
-        att_7  = _window(ssdf, snapshot_day, 7)[attend_col].mean()  if len(ssdf) else 0.0
-        sc_14  = _window(ssdf, snapshot_day, 14)[score_col].dropna()
-        sc_7   = _window(ssdf, snapshot_day, 7)[score_col].dropna()
-
-        row[f"{subj_lc}_attend_14d"]      = att_14
-        row[f"{subj_lc}_attend_drop_pct"] = _pct_drop(att_14, att_7)
-        row[f"{subj_lc}_score_14d"]       = sc_14.mean() if len(sc_14) else np.nan
-        row[f"{subj_lc}_score_7d"]        = sc_7.mean()  if len(sc_7)  else np.nan
-        row[f"{subj_lc}_score_drop_pct"]  = _pct_drop(
-            sc_14.mean() if len(sc_14) else 0,
-            sc_7.mean()  if len(sc_7)  else 0,
-        )
-
-    return row
+    logger.info("Built %d feature rows with %d features", len(features), features.shape[1])
+    return features.reset_index()
 
 
-def _safe_score_delta(sdf: pd.DataFrame, snapshot_day: int) -> float:
-    """Score in last 7d minus score in prior 7d (day-14 to day-7)."""
-    recent = _window(sdf, snapshot_day, 7)["test_score_mean"].dropna()
-    older  = sdf[(sdf["day"] > snapshot_day - 14) &
-                 (sdf["day"] <= snapshot_day - 7)]["test_score_mean"].dropna()
-    if len(recent) == 0 or len(older) == 0:
-        return 0.0
-    return float(recent.mean() - older.mean())
+def _positive_drop(before: pd.Series, after: pd.Series) -> pd.Series:
+    return ((before - after) / before.where(before >= 1e-6)).clip(lower=0)
+
+
+def _grouped_score_slope(daily: pd.DataFrame) -> pd.Series:
+    """Use the same OLS slope as _score_slope over each student's observed scores."""
+    scores = (daily[["student_id", "day", "test_score_mean"]]
+              .dropna(subset=["test_score_mean"]).sort_values("day"))
+    position = scores.groupby("student_id", sort=False).cumcount()
+    stats = scores.assign(weighted_score=position * scores["test_score_mean"]).groupby(
+        "student_id", sort=False
+    ).agg(count=("test_score_mean", "size"), total=("test_score_mean", "sum"),
+          weighted=("weighted_score", "sum"))
+    count = stats["count"]
+    numerator = 12 * (stats["weighted"] - (count - 1) * stats["total"] / 2)
+    denominator = count * (count ** 2 - 1)
+    return (numerator / denominator.where(count > 1)).fillna(0)
+
+
 
 
 def fill_missing_features(feat_df: pd.DataFrame) -> pd.DataFrame:

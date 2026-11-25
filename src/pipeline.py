@@ -47,18 +47,30 @@ SUBJECTS     = CFG["data"]["subjects"]
 PROCESSED_DIR = ROOT / "data" / "processed"
 
 
-def _ensure_data_exists():
-    """Generate synthetic data if not present."""
-    events_path = ROOT / "data" / "raw" / "student_events.csv"
-    if not events_path.exists():
-        logger.info("Synthetic data not found — generating now …")
-        import subprocess, sys
-        subprocess.run(
-            [sys.executable, str(ROOT / "data" / "synthetic_generator.py")],
-            check=True,
-        )
-    else:
-        logger.info("Raw data found (%s)", events_path)
+def _ensure_data_exists() -> bool:
+    """Generate missing or stale synthetic data while preserving external inputs."""
+    from data.synthetic_generator import (
+        EVENTS, LABELS, MANIFEST, RAW_DIR, main as generate, synthetic_settings,
+    )
+
+    events_path, labels_path = RAW_DIR / EVENTS, RAW_DIR / LABELS
+    manifest = RAW_DIR / MANIFEST
+    if not events_path.exists() and not labels_path.exists():
+        generate()
+        return True
+    if manifest.exists():
+        if (not events_path.exists() or not labels_path.exists()
+                or json.loads(manifest.read_text(encoding="utf-8")) != synthetic_settings(CFG["data"])):
+            generate()
+        return True
+    if events_path.exists() and labels_path.exists():
+        # The original generator left its archetype marker in both CSVs.
+        if all("archetype" in pd.read_csv(path, nrows=0).columns for path in (events_path, labels_path)):
+            generate()
+            return True
+        logger.info("Using existing input files in %s", RAW_DIR)
+        return False
+    raise FileNotFoundError(f"Both {EVENTS} and {LABELS} are required in {RAW_DIR}")
 
 
 def run_pipeline(train_model: bool = True) -> dict:
@@ -76,30 +88,31 @@ def run_pipeline(train_model: bool = True) -> dict:
     t0 = time.time()
 
     # ── Step 1: Data ──────────────────────────────────────────────────────────
-    _ensure_data_exists()
+    is_synthetic = _ensure_data_exists()
 
     from src.ingestion.data_loader import (
         load_raw_data, get_student_metadata,
-        get_events_up_to_day, pivot_to_daily, pivot_to_daily_per_subject,
+        pivot_to_daily, pivot_to_daily_per_subject,
     )
     logger.info("Step 1/8 — Loading data …")
-    events_df, labels_df = load_raw_data()
+    events_df, labels_df = load_raw_data(before_day=SNAPSHOT_DAY)
     meta_df = get_student_metadata(events_df)
 
-    events_snap = get_events_up_to_day(events_df, SNAPSHOT_DAY)
-    daily_df    = pivot_to_daily(events_snap)
+    daily_df = pivot_to_daily(events_df)
 
     subject_dfs = {
-        subj: pivot_to_daily_per_subject(events_snap, subj)
+        subj: pivot_to_daily_per_subject(events_df, subj)
         for subj in SUBJECTS
     }
+    del events_df
 
     # ── Step 2: Feature Engineering ───────────────────────────────────────────
     from src.features.feature_engineering import (
         build_features, fill_missing_features, get_feature_columns,
     )
     logger.info("Step 2/8 — Engineering features …")
-    feat_df = build_features(daily_df, subject_dfs, SNAPSHOT_DAY)
+    feat_df = build_features(daily_df, subject_dfs, SNAPSHOT_DAY - 1)
+    del daily_df, subject_dfs
     feat_df = fill_missing_features(feat_df)
     feature_cols = get_feature_columns(feat_df)
     logger.info("  → %d features for %d students", len(feature_cols), len(feat_df))
@@ -130,39 +143,30 @@ def run_pipeline(train_model: bool = True) -> dict:
     )
 
     # ── Step 5: SHAP Explanations ─────────────────────────────────────────────
-    from src.explainability.shap_explainer import StudentShapExplainer, explain_student
+    from src.explainability.shap_explainer import StudentShapExplainer
 
     logger.info("Step 5/8 — Computing SHAP explanations …")
+    alerts = risk_df.loc[risk_df["risk_tier"].isin(["High", "Critical"])]
+    indexed_features = feat_df.set_index("student_id")
+    alert_features = indexed_features.loc[alerts["student_id"]]
     explainer = StudentShapExplainer(model, feature_cols)
+    shap_values = explainer.explain_batch(
+        scaler.transform(alert_features[feature_cols].to_numpy(dtype="float32"))
+    ) if len(alerts) else []
+    logger.info("  Computed SHAP for %d at-risk students", len(alerts))
 
-    X_all = feat_df[feature_cols].values.astype("float32")
-    import sklearn.preprocessing as skp
-    X_all_s = scaler.transform(X_all)
-
-    # Compute SHAP for HIGH + CRITICAL students only (performance)
-    alert_students = risk_df[risk_df["risk_tier"].isin(["High", "Critical"])]["student_id"].tolist()
-    logger.info("  Computing SHAP for %d at-risk students …", len(alert_students))
-
-    shap_dict: dict[int, list[dict]] = {}
-    for sid in alert_students:
-        factors = explain_student(sid, feat_df, feature_cols, explainer, scaler, top_k=3)
-        shap_dict[sid] = factors
-
-    # ── Step 6: Interventions ─────────────────────────────────────────────────
     from src.interventions.recommendation_engine import generate_intervention
 
     logger.info("Step 6/8 — Generating interventions …")
     intervention_records = []
-    for _, row in risk_df[risk_df["risk_tier"].isin(["High", "Critical"])].iterrows():
-        sid  = int(row["student_id"])
-        feat_row = feat_df[feat_df["student_id"] == sid].iloc[0].to_dict()
-        factors  = shap_dict.get(sid, [])
-
+    for row, (_, feat_row), sv in zip(alerts.itertuples(index=False), alert_features.iterrows(), shap_values):
+        sid = int(row.student_id)
+        factors = explainer.factors_from_values(sv, feat_row)
         result = generate_intervention(
             student_id=sid,
-            risk_score=float(row["risk_score"]),
-            risk_tier=str(row["risk_tier"]),
-            features=feat_row,
+            risk_score=float(row.risk_score),
+            risk_tier=str(row.risk_tier),
+            features=feat_row.fillna(0).to_dict(),
             shap_factors=factors,
             use_llm=True,
         )
@@ -175,13 +179,16 @@ def run_pipeline(train_model: bool = True) -> dict:
             "llm_narrative":     result.llm_narrative,
         })
 
-    interventions_df = pd.DataFrame(intervention_records) if intervention_records else pd.DataFrame()
+    interventions_df = pd.DataFrame(intervention_records, columns=[
+        "student_id", "intervention_type", "urgency_hours", "interventions", "top_reasons", "llm_narrative",
+    ])
 
     # ── Step 7: Simulate Outcomes ─────────────────────────────────────────────
     from src.tracking.outcome_tracker import simulate_outcomes, compute_outcome_metrics
 
-    logger.info("Step 7/8 — Simulating outcome data …")
-    simulate_outcomes(risk_df, n_intervened=min(200, len(alert_students)))
+    logger.info("Step 7/8 — Preparing outcome data …")
+    if is_synthetic:
+        simulate_outcomes(risk_df)
     outcome_metrics = compute_outcome_metrics()
 
     # ── Step 8: Save Risk Report ──────────────────────────────────────────────
@@ -190,15 +197,11 @@ def run_pipeline(train_model: bool = True) -> dict:
 
     report_df = (
         risk_df
-        .merge(meta_df, on="student_id", how="left")
-        .merge(labels_df[["student_id", "disengaged_in_14d", "archetype"]], on="student_id", how="left")
+        .merge(meta_df, on="student_id", how="left", validate="one_to_one")
+        .merge(labels_df.reindex(columns=["student_id", "disengaged_in_14d", "archetype"]),
+               on="student_id", how="left", validate="one_to_one")
+        .merge(interventions_df, on="student_id", how="left", validate="one_to_one")
     )
-    if not interventions_df.empty:
-        report_df = report_df.merge(
-            interventions_df[["student_id", "intervention_type", "urgency_hours",
-                              "interventions", "top_reasons", "llm_narrative"]],
-            on="student_id", how="left",
-        )
 
     report_path = PROCESSED_DIR / "risk_report.csv"
     report_df.to_csv(report_path, index=False)

@@ -9,7 +9,7 @@ gemini:
   
 
 data:
-  synthetic_students: 5000
+  synthetic_students: 50000
   simulation_days: 90
   snapshot_day: 75            # Features computed at this day; label = 14 days ahead
   subjects:

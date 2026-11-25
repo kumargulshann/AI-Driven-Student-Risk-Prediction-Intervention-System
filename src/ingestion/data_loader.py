@@ -28,6 +28,8 @@ REQUIRED_LABEL_COLS = ["student_id", "disengaged_in_14d"]
 def load_raw_data(
     events_path: str | Path | None = None,
     labels_path: str | Path | None = None,
+    *,
+    before_day: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load raw CSV files and return (events_df, labels_df)."""
     raw_dir    = ROOT / "data" / "raw"
@@ -40,7 +42,21 @@ def load_raw_data(
             "Run:  python data/synthetic_generator.py"
         )
 
-    events_df = pd.read_csv(events_path, low_memory=False)
+    if before_day is None:
+        events_df = pd.read_csv(events_path, low_memory=False)
+    else:
+        # Compact dtypes and early cutoff keep large raw exports within memory.
+        dtypes = {
+            **dict.fromkeys(("batch_id", "city", "course", "subject"), "category"),
+            **dict.fromkeys(("day", "student_id"), "int64"),
+            **dict.fromkeys(("attended_lecture", "test_attempted", "assignment_done",
+                             "doubt_asked", "revision_done"), "uint8"),
+            **dict.fromkeys(("completion_rate", "test_score", "app_minutes"), "float32"),
+        }
+        events_df = pd.read_csv(
+            events_path, dtype=dtypes, usecols=lambda column: column in REQUIRED_EVENT_COLS,
+        )
+        events_df = events_df.loc[events_df["day"].lt(before_day)].reset_index(drop=True)
     labels_df = pd.read_csv(labels_path)
 
     _validate_schema(events_df, REQUIRED_EVENT_COLS, "events")
@@ -80,7 +96,7 @@ def pivot_to_daily(events_df: pd.DataFrame) -> pd.DataFrame:
     """
     agg = (
         events_df
-        .groupby(["student_id", "day"])
+        .groupby(["student_id", "day"], sort=False)
         .agg(
             attended_any        = ("attended_lecture",  "max"),
             attend_rate         = ("attended_lecture",  "mean"),
@@ -99,9 +115,9 @@ def pivot_to_daily(events_df: pd.DataFrame) -> pd.DataFrame:
 
 def pivot_to_daily_per_subject(events_df: pd.DataFrame, subject: str) -> pd.DataFrame:
     """Return daily aggregates for a single subject."""
-    df = events_df[events_df["subject"] == subject].copy()
+    df = events_df.loc[events_df["subject"].eq(subject), ["student_id", "day", "attended_lecture", "test_score"]]
     agg = (
-        df.groupby(["student_id", "day"])
+        df.groupby(["student_id", "day"], sort=False)
         .agg(
             attend   = ("attended_lecture", "mean"),
             score    = ("test_score",       "mean"),

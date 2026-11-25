@@ -117,12 +117,11 @@ class StudentShapExplainer:
         Returns a list of dicts:
           {"feature": ..., "shap": ..., "label": ..., "narrative": ...}
         """
-        shap_vals = self.explainer.shap_values(X_scaled[[student_idx]])
-        if isinstance(shap_vals, list):
-            sv = shap_vals[1][0]
-        else:
-            sv = shap_vals[0]
+        sv = self.explain_batch(X_scaled[[student_idx]])[0]
+        return self.factors_from_values(sv, feat_df_row, top_k)
 
+    def factors_from_values(self, sv, feat_df_row, top_k=3):
+        # Format the strongest risk contributions from a precomputed SHAP row.
         # Sort by |SHAP| descending, pick positive-SHAP (risk-increasing) first
         indices = np.argsort(-np.abs(sv))[:top_k * 2]
         # Prefer factors that INCREASE risk

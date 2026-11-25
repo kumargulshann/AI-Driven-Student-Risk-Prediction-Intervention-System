@@ -25,6 +25,7 @@ Student 1042 | Risk: 78% | Tier: High
 
 import yaml
 import logging
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -36,7 +37,7 @@ with open(ROOT / "config.yaml") as f:
 
 INT_CFG = CFG["interventions"]["rules"]
 USE_LLM = CFG["gemini"]["use_llm_narratives"]
-GEMINI_KEY = CFG["gemini"]["api_key"]
+GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or CFG["gemini"]["api_key"]
 GEMINI_MODEL = CFG["gemini"]["model"]
 
 
@@ -197,7 +198,7 @@ def generate_llm_narrative(
     interventions: list[str],
 ) -> str:
     """Call Gemini API; returns rule-based fallback if call fails."""
-    if not USE_LLM:
+    if not USE_LLM or not GEMINI_KEY:
         return _rule_based_narrative(student_id, risk_score, risk_tier, reasons, interventions)
 
     try:

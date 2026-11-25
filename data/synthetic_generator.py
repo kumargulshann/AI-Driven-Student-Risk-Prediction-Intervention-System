@@ -1,187 +1,135 @@
-"""
-Synthetic Student Behavioral Data Generator
-============================================
-Generates realistic student behavioral data for 5,000 students
-over 90 days across PW-style subjects (Physics, Chemistry, Maths, Biology).
+"""Generate reproducible synthetic event and label CSVs in bounded batches."""
 
-Output: data/raw/student_events.csv + data/raw/student_labels.csv
-"""
+import json
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
-import os
 import yaml
-from pathlib import Path
-
-# ── reproducibility ────────────────────────────────────────────────────────────
-np.random.seed(42)
-
-ROOT = Path(__file__).parent.parent
-with open(ROOT / "config.yaml") as f:
-    CFG = yaml.safe_load(f)
-
-N_STUDENTS   = CFG["data"]["synthetic_students"]
-SIM_DAYS     = CFG["data"]["simulation_days"]
-SUBJECTS     = CFG["data"]["subjects"]
-SNAPSHOT_DAY = CFG["data"]["snapshot_day"]
-
-# ── Student Archetype Definitions ──────────────────────────────────────────────
-# Each archetype describes a learning trajectory pattern
-ARCHETYPES = {
-    "star":           {"weight": 0.20, "disengage_prob": 0.03},
-    "consistent":     {"weight": 0.30, "disengage_prob": 0.08},
-    "at_risk_early":  {"weight": 0.15, "disengage_prob": 0.72},
-    "gradual_drop":   {"weight": 0.20, "disengage_prob": 0.55},
-    "irregular":      {"weight": 0.10, "disengage_prob": 0.40},
-    "recovered":      {"weight": 0.05, "disengage_prob": 0.12},
-}
-
-def sample_archetype() -> str:
-    names = list(ARCHETYPES.keys())
-    weights = [ARCHETYPES[a]["weight"] for a in names]
-    return np.random.choice(names, p=weights)
 
 
-def base_engagement(archetype: str, day: int) -> float:
-    """Return a 0-1 base engagement level given archetype and day in cycle."""
-    if archetype == "star":
-        return np.clip(np.random.normal(0.90, 0.05), 0.70, 1.0)
-    elif archetype == "consistent":
-        return np.clip(np.random.normal(0.75, 0.08), 0.55, 0.95)
-    elif archetype == "at_risk_early":
-        # Starts ok, drops steeply after day 15
-        decay = max(0, (day - 15) / 60)
-        return np.clip(np.random.normal(0.70 - 0.55 * decay, 0.10), 0.05, 0.95)
-    elif archetype == "gradual_drop":
-        decay = day / SIM_DAYS
-        return np.clip(np.random.normal(0.80 - 0.45 * decay, 0.08), 0.05, 0.95)
-    elif archetype == "irregular":
-        # Bursty — alternates high and low weeks
-        cycle = np.sin(day / 7 * np.pi)
-        return np.clip(np.random.normal(0.60 + 0.20 * cycle, 0.15), 0.10, 0.95)
-    elif archetype == "recovered":
-        # Drops then recovers
-        midpoint = SIM_DAYS // 2
-        if day < midpoint:
-            decay = day / midpoint
-            return np.clip(np.random.normal(0.75 - 0.40 * decay, 0.10), 0.05, 0.95)
-        else:
-            recovery = (day - midpoint) / midpoint
-            return np.clip(np.random.normal(0.40 + 0.40 * recovery, 0.10), 0.10, 0.95)
-    return 0.5
+ROOT = Path(__file__).resolve().parent.parent
+RAW_DIR = ROOT / "data" / "raw"
+EVENTS = "student_events.csv"
+LABELS = "student_labels.csv"
+MANIFEST = "synthetic_config.json"
+BATCH_SIZE = 1_000
+HORIZON = 14
+
+ARCHETYPES = ("star", "consistent", "at_risk_early", "gradual_drop", "irregular", "recovered")
+WEIGHTS = (0.20, 0.30, 0.15, 0.20, 0.10, 0.05)
+CITIES = ("Delhi", "Mumbai", "Bangalore", "Hyderabad", "Pune", "Jaipur", "Lucknow", "Patna", "Kolkata")
+COURSES = ("JEE Advanced", "JEE Mains", "NEET", "Foundation")
+BATCHES = tuple(f"BATCH_{i:03d}" for i in range(1, 21))
 
 
-def generate_student_record(student_id: int) -> list[dict]:
-    archetype    = sample_archetype()
-    batch_id     = f"BATCH_{np.random.randint(1, 21):03d}"
-    city         = np.random.choice(["Delhi", "Mumbai", "Bangalore", "Hyderabad",
-                                     "Pune", "Jaipur", "Lucknow", "Patna", "Kolkata"])
-    course       = np.random.choice(["JEE Advanced", "JEE Mains", "NEET", "Foundation"])
-    join_day     = np.random.randint(0, 10)
-    target_score = np.random.uniform(60, 100)  # aspirational %
-    records      = []
-
-    # subject-level base bias
-    subj_bias = {s: np.random.normal(0, 0.08) for s in SUBJECTS}
-
-    for day in range(join_day, SIM_DAYS):
-        eng = base_engagement(archetype, day - join_day)
-
-        for subject in SUBJECTS:
-            s_eng = np.clip(eng + subj_bias[subject], 0.0, 1.0)
-
-            # derive signals from engagement level
-            did_attend       = int(np.random.random() < s_eng)
-            completion_rate  = np.clip(np.random.normal(s_eng, 0.10), 0, 1) if did_attend else 0.0
-            test_attempted   = int(np.random.random() < s_eng * 0.7)
-            raw_score        = np.clip(np.random.normal(target_score * s_eng / 100, 10), 0, 100) \
-                               if test_attempted else np.nan
-            assignment_done  = int(np.random.random() < s_eng * 0.85)
-            doubt_asked      = int(np.random.random() < s_eng * 0.3)
-            revision_done    = int(np.random.random() < s_eng * 0.5)
-
-            records.append({
-                "student_id":        student_id,
-                "batch_id":          batch_id,
-                "city":              city,
-                "course":            course,
-                "archetype":         archetype,  # dropped before modeling
-                "day":               day,
-                "subject":           subject,
-                "attended_lecture":  did_attend,
-                "completion_rate":   round(completion_rate, 3),
-                "test_attempted":    test_attempted,
-                "test_score":        round(raw_score, 2) if not np.isnan(raw_score) else np.nan,
-                "assignment_done":   assignment_done,
-                "doubt_asked":       doubt_asked,
-                "revision_done":     revision_done,
-            })
-
-        # App-level daily signal (once per day, not per subject)
-        if subject == SUBJECTS[-1]:  # append once using last subject iteration
-            records[-1]["app_minutes"] = round(
-                np.clip(np.random.normal(eng * 90, 20), 0, 180), 1
-            )
-
-    return records, archetype
+def synthetic_settings(config: dict) -> dict:
+    return {
+        key: config[key]
+        for key in ("synthetic_students", "simulation_days", "snapshot_day", "subjects")
+    }
 
 
-def compute_label(student_df: pd.DataFrame, snapshot_day: int, window: int = 14) -> int:
-    """
-    Ground-truth disengagement label.
-    1 = student significantly disengages in the [snapshot_day, snapshot_day+window] window.
-    Criterion: average attendance in the post-window drops >40% vs prior 14 days.
-    """
-    pre  = student_df[(student_df["day"] >= snapshot_day - 14) & (student_df["day"] < snapshot_day)]
-    post = student_df[(student_df["day"] >= snapshot_day) & (student_df["day"] < snapshot_day + window)]
-    if len(pre) == 0 or len(post) == 0:
-        return 0
-    pre_attend  = pre["attended_lecture"].mean()
-    post_attend = post["attended_lecture"].mean()
-    drop = (pre_attend - post_attend) / (pre_attend + 1e-9)
-    return int(drop > 0.40)
+def _engagement(rng, archetypes, age, days):
+    midpoint = max(1, days // 2)
+    means = np.vstack((
+        np.broadcast_to(0.90, age.shape),
+        np.broadcast_to(0.75, age.shape),
+        0.70 - 0.55 * np.maximum(0, (age - 15) / 60),
+        0.80 - 0.45 * age / days,
+        0.60 + 0.20 * np.sin(age / 7 * np.pi),
+        np.where(age < midpoint, 0.75 - 0.40 * age / midpoint,
+                 0.40 + 0.40 * (age - midpoint) / midpoint),
+    )).reshape(len(ARCHETYPES), *age.shape)
+    students = np.arange(len(archetypes))
+    mean = means[archetypes, students, :]
+    std = np.array((0.05, 0.08, 0.10, 0.08, 0.15, 0.10))[archetypes, None]
+    lower = np.array((0.70, 0.55, 0.05, 0.05, 0.10, 0.05))[archetypes, None]
+    lower = np.where((archetypes[:, None] == 5) & (age >= midpoint), 0.10, lower)
+    upper = np.where(archetypes[:, None] == 0, 1.0, 0.95)
+    return np.clip(rng.normal(mean, std), lower, upper)
+
+
+def _generate_batch(rng, ids, days, subjects, snapshot):
+    count = len(ids)
+    subject_count = len(subjects)
+    shape = (count, days, subject_count)
+    day = np.arange(days)
+    joining = rng.integers(0, min(10, snapshot - HORIZON + 1), count)
+    age = day[None, :] - joining[:, None]
+    archetype = rng.choice(len(ARCHETYPES), count, p=WEIGHTS)
+    engagement = _engagement(rng, archetype, age, days)
+    subject_bias = rng.normal(0, 0.08, size=(count, 1, subject_count))
+    subject_engagement = np.clip(engagement[:, :, None] + subject_bias, 0, 1)
+
+    attended = rng.random(shape) < subject_engagement
+    attempted = rng.random(shape) < subject_engagement * 0.7
+    completion = np.where(attended, np.clip(rng.normal(subject_engagement, 0.10), 0, 1), 0)
+    target = rng.uniform(60, 100, size=(count, 1, 1))
+    scores = np.where(attempted, np.clip(rng.normal(target * subject_engagement, 10), 0, 100), np.nan)
+    app_minutes = np.clip(rng.normal(engagement * 90, 20), 0, 180).round(1)
+
+    student_idx, day_idx, subject_idx = np.nonzero(np.broadcast_to((age >= 0)[:, :, None], shape))
+    index = student_idx, day_idx, subject_idx
+    archetype_names = np.asarray(ARCHETYPES)[archetype]
+    events = pd.DataFrame({
+        "student_id": ids[student_idx],
+        "batch_id": rng.choice(BATCHES, count)[student_idx],
+        "city": rng.choice(CITIES, count)[student_idx],
+        "course": rng.choice(COURSES, count)[student_idx],
+        "archetype": archetype_names[student_idx],
+        "day": day_idx,
+        "subject": np.asarray(subjects)[subject_idx],
+        "attended_lecture": attended[index].astype("uint8"),
+        "completion_rate": completion[index].round(3),
+        "test_attempted": attempted[index].astype("uint8"),
+        "test_score": scores[index].round(2),
+        "assignment_done": (rng.random(shape)[index] < subject_engagement[index] * 0.85).astype("uint8"),
+        "doubt_asked": (rng.random(shape)[index] < subject_engagement[index] * 0.3).astype("uint8"),
+        "revision_done": (rng.random(shape)[index] < subject_engagement[index] * 0.5).astype("uint8"),
+        "app_minutes": app_minutes[student_idx, day_idx],
+    })
+    pre = attended[:, snapshot - HORIZON:snapshot].mean(axis=(1, 2))
+    post = attended[:, snapshot:snapshot + HORIZON].mean(axis=(1, 2))
+    labels = pd.DataFrame({
+        "student_id": ids,
+        "archetype": archetype_names,
+        "disengaged_in_14d": ((pre - post) / (pre + 1e-9) > 0.40).astype("uint8"),
+    })
+    return events, labels
 
 
 def main():
-    out_dir = ROOT / "data" / "raw"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    with (ROOT / "config.yaml").open(encoding="utf-8") as config_file:
+        settings = synthetic_settings(yaml.safe_load(config_file)["data"])
+    students = settings["synthetic_students"]
+    days = settings["simulation_days"]
+    snapshot = settings["snapshot_day"]
+    subjects = settings["subjects"]
+    if students < 1 or not HORIZON <= snapshot <= days - HORIZON or not subjects:
+        raise ValueError("Synthetic generation requires students, subjects and full pre/post label windows.")
 
-    all_records = []
-    labels      = []
+    rng = np.random.default_rng(42)
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    event_count = positive_count = 0
+    print(f"Generating {students:,} student records over {days} days", flush=True)
+    with TemporaryDirectory(dir=RAW_DIR) as staging:
+        staging = Path(staging)
+        for offset in range(0, students, BATCH_SIZE):
+            ids = np.arange(offset + 1, min(students, offset + BATCH_SIZE) + 1, dtype=np.int32)
+            events, labels = _generate_batch(rng, ids, days, subjects, snapshot)
+            events.to_csv(staging / EVENTS, index=False, mode="a", header=offset == 0)
+            labels.to_csv(staging / LABELS, index=False, mode="a", header=offset == 0)
+            event_count += len(events)
+            positive_count += int(labels["disengaged_in_14d"].sum())
 
-    print(f"Generating {N_STUDENTS} student records over {SIM_DAYS} days …")
+        for filename in (EVENTS, LABELS):
+            os.replace(staging / filename, RAW_DIR / filename)
+        (RAW_DIR / MANIFEST).write_text(json.dumps(settings), encoding="utf-8")
 
-    for sid in range(1, N_STUDENTS + 1):
-        records, archetype = generate_student_record(sid)
-        all_records.extend(records)
-
-        student_df = pd.DataFrame(records)
-        label      = compute_label(student_df, SNAPSHOT_DAY)
-        labels.append({
-            "student_id":         sid,
-            "archetype":          archetype,
-            "disengaged_in_14d":  label,
-        })
-
-        if sid % 500 == 0:
-            print(f"  … {sid}/{N_STUDENTS} students done")
-
-    events_df = pd.DataFrame(all_records)
-    # fill app_minutes forward (it was only written on last-subject rows)
-    events_df["app_minutes"] = events_df.groupby(["student_id", "day"])["app_minutes"].transform("max")
-
-    labels_df = pd.DataFrame(labels)
-
-    events_path = out_dir / "student_events.csv"
-    labels_path = out_dir / "student_labels.csv"
-    events_df.to_csv(events_path, index=False)
-    labels_df.to_csv(labels_path, index=False)
-
-    pos_rate = labels_df["disengaged_in_14d"].mean()
-    print(f"\n✅ Done!")
-    print(f"   Events  : {len(events_df):,} rows  →  {events_path}")
-    print(f"   Labels  : {len(labels_df):,} rows  →  {labels_path}")
-    print(f"   Disengagement rate: {pos_rate:.1%}  ({int(pos_rate*N_STUDENTS)} at-risk students)")
+    print(f"Generated {event_count:,} events and {students:,} labels ({positive_count:,} positives).", flush=True)
 
 
 if __name__ == "__main__":

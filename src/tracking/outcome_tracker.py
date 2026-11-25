@@ -166,7 +166,7 @@ def simulate_outcomes(risk_df: pd.DataFrame, n_intervened: int = 200) -> pd.Data
             "score_improvement":  None,
         })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=OUTCOMES_COLS)
     # Compute score improvement
     df["score_improvement"] = df["score_after"] - df["score_before"]
     _save_outcomes(df)
